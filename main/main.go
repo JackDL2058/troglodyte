@@ -11,6 +11,7 @@ import (
 )
 
 func main() {
+	//e.Web()
 	restore := troglodyte.Init()
 	defer restore()
 	troglodyte.Input.Start(true)
@@ -127,6 +128,10 @@ func main() {
 			cVelX += 0.5
 		}
 
+		troglodyte.DrawTitle(1,1,"",troglodyte.Default,troglodyte.BgBlue)
+		if troglodyte.Input.JustHandled("k"){
+			troglodyte.DrawTitle(1,1,"You pressed K!",troglodyte.Default,troglodyte.BgBlue)
+		}
 		troglodyte.DrawFilledCircle(int(cx), int(cy), int(cSize), "▒", troglodyte.Cyan, "", true)
 		troglodyte.MainLoop()
 		time.Sleep(16 * time.Millisecond)

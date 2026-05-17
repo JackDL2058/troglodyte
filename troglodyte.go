@@ -5,6 +5,7 @@ package troglodyte
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -13,12 +14,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"golang.org/x/term"
 )
 
 var (
-	BuildNumber    = "0.0.15" // Build version
+	BuildNumber    = "0.0.17" // Build version
 	GlobalFixRatio = 2.0      // the ratio for fixed ratio shapes to use, which the x is multiplied by to result in a wider circle, to counter tall terminal characters.
 	out            = bufio.NewWriterSize(os.Stdout, 1024*128)
 
@@ -30,6 +32,7 @@ var (
 	// Global Registry
 	allSprites []*Sprite
 	spriteMu   sync.RWMutex
+	keyHandled = make(map[string]bool) // flags to prevent continuous key adding
 )
 
 type projection int
@@ -125,6 +128,39 @@ type Fake3dWall struct {
 	FallbackSymbol string   // the symbol to use if angle dither fails. If angle dither is off, this is used as the symbol.
 	AngleDither    bool     // whether to dither based on the angle of a wall relative to the camera. If false, uses FallbackSymbol.
 	Tags           []string // Slice of tags, to differentiate walls, maybe for different levels, which will be shown in an example.
+}
+
+// A raycast object in fake 3D. Used to determine the distance to a Fake3DWall or other Fake3D objects.
+type Fake3DRaycast struct {
+	Direction float64 // radians
+	X         float64 // x position
+	Y         float64 // y position
+	Travelx   float64 // how far to move on the x axis, calculated by cos(direction)
+	Travely   float64 // how far to move on the y axis, calculated by sin(direction)
+	Distance  float64 // how many total units the raycast object has travelled.
+}
+
+// A box that you can enter text into. It needs to be focused on by using one of the keys in the FocusKeys field.
+// To use mouse buttons in the FocusKeys field, use "lc" as left click, "rc" for right and "mc" for middle. Pressing enter will call the
+// EnterFunction function.
+type TextInput struct {
+	X             int      // x position of the input box
+	Y             int      // y position of the input box
+	Text          string   // The actual text being entered into the box
+	Prompt        string   // The prompt that appears in the box if no text has been entered
+	FocusKeys     []string // A slice of keys required to focus or unfocus on the text input
+	EnterFunction func()   // the function called when the enter key is pressed
+}
+
+func NewTextInput(x, y int, prompt string, focusKeys []string, enterFunction func()) *TextInput {
+	return &TextInput{
+		X:             x,
+		Y:             y,
+		Text:          "",
+		Prompt:        prompt,
+		FocusKeys:     focusKeys,
+		EnterFunction: enterFunction,
+	}
 }
 
 // #endregion
@@ -357,6 +393,68 @@ func DrawSpritesWithTag(tag string) {
 
 // #region Graphics
 
+// drawTitle draws a text title using pixel data from letters.json at the specified position.
+//
+// x, y: starting position of the title
+//
+// title: the text to draw
+//
+// fg: foreground color (e.g., troglodyte.White, troglodyte.Cyan)
+//
+// bg: background color (e.g., troglodyte.BgDefault, "")
+func DrawTitle(x, y int, title, fg, bg string) {
+
+	// Load and parse letters.json
+	data, err := os.ReadFile("letters.json")
+	if err != nil {
+		return
+	}
+
+	var letters map[string]map[string]string
+	err = json.Unmarshal(data, &letters)
+	if err != nil {
+		return
+	}
+
+	title = strings.ToUpper(title)
+
+	currentX := x
+	// Draw each character in the title
+	for _, char := range title {
+		charStr := string(char)
+		letterData, exists := letters[charStr]
+		if !exists {
+			// Skip characters not in the font
+			continue
+		}
+
+		// Extract the 5 rows of pixel data
+		rows := make([]string, 5)
+		for i := 1; i <= 5; i++ {
+			rowKey := string(rune('0' + i))
+			if row, ok := letterData[rowKey]; ok {
+				rows[i-1] = row
+			}
+		}
+
+		// Draw the character's pixels
+		for rowIdx, row := range rows {
+			for colIdx, pixelChar := range row {
+				if pixelChar == '#' {
+					// Draw a filled pixel
+					p := Pixel{Char: "█", FgColour: fg, BgColour: bg}
+					SetPixel(currentX+colIdx, y+rowIdx, p)
+				}
+			}
+		}
+
+		// Move to the next character position
+		if len(rows) > 0 {
+			currentX += len(rows[0]) + 1 // +1 for spacing between characters
+		}
+	}
+}
+
 func DrawLine(x1, y1, x2, y2 int, char, fg, bg string) {
 	dx := int(math.Abs(float64(x2 - x1)))
 	dy := -int(math.Abs(float64(y2 - y1)))
@@ -487,7 +585,7 @@ func DrawCircle(xc, yc, r int, char, fg, bg string, fixRatio bool) {
 // triangle all add up to exactly 180 degrees. This triangle is also GUARANTEED to have at least zero sides, and less than 50 sides. It is also guaranteed that the
 // triangle will be a triangle, as long as it is a triangle, although you'd have to find a way to objectively define triangle and all of its components, including
 // shape, three, side, line, and lots of abstract concepts which will be hard to define objectively. Anyways this triangle is guaranteed to work, if it doesn't
-// not work, or if it doesn't go not correct. However to guarantee any of these guarantees you'd need to define guarantee, and i could guarantee you couldn't
+// not work, or if it doesn't go not not incorrect. However to guarantee any of these guarantees you'd need to define guarantee, and i could guarantee you couldn't
 // not do that if you guaranteed you wouldn't not do it not incorrectly, and that guarantee wasn't not not incorrect, but to guarantee that you'd need to define
 // incorrect. That was a lot of guarantees, and if you're still here, the secret code is eleven, three, four and five, and I had to use words for that, otherwise
 // people skipping over this whole thing would see the secret code in numbers, which are highly distinct from letters. I can guarantee if you're still reading
@@ -697,14 +795,16 @@ func writeMoveCursorFast(row, col int) {
 // #region Input Manager
 
 type InputManager struct {
-	mu             sync.RWMutex
-	PressedKeys    map[string]bool
-	mouseX, mouseY int
-	leftDown       bool
+	mu              sync.RWMutex
+	PressedKeys     map[string]bool
+	prevPressedKeys map[string]bool
+	mouseX, mouseY  int
+	leftDown        bool
 }
 
 var Input = &InputManager{
-	PressedKeys: make(map[string]bool),
+	PressedKeys:     make(map[string]bool),
+	prevPressedKeys: make(map[string]bool),
 }
 
 // IsPressed checks if a keyboard key is currently in the active buffer.
@@ -769,9 +869,53 @@ func (im *InputManager) Start(useMouse bool) {
 	}()
 }
 
+// Deprecated: JustPressed returns true if the key is currently pressed but wasn't pressed in the previous frame
+func (im *InputManager) JustPressed(key string) bool {
+	im.mu.RLock()
+	defer im.mu.RUnlock()
+	return im.PressedKeys[key] && !im.prevPressedKeys[key]
+}
+
+// Similar to JustPressed, but uses better system of 'handling' keys so that they don't get constantly typed if you press for more than a frame.
+// This solution also accounts for echo, so if you purposefully hold down a key it works like you would expect in something like microsoft word.
+func (im *InputManager) JustHandled(key string) bool {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+
+	isDown := im.PressedKeys[key]
+
+	// If the key is released, reset the handled state for next time
+	if !isDown {
+		keyHandled[key] = false
+		return false
+	}
+
+	// If it's down but already handled, return false
+	if keyHandled[key] {
+		return false
+	}
+
+	// If it's down and NOT handled, handle it now and return true
+	keyHandled[key] = true
+	return true
+}
+
+// GetCurrentTypableKey returns the first pressed typable key (printable character),
+// or empty string if none are pressed
+func (im *InputManager) GetCurrentTypableKey() string {
+	im.mu.RLock()
+	defer im.mu.RUnlock()
+	for key, pressed := range im.PressedKeys {
+		if pressed && len(key) == 1 && unicode.IsPrint(rune(key[0])) {
+			return key
+		}
+	}
+	return ""
+}
+
 // #endregion
 
-func Version() { fmt.Println("Troglodyte Engine v" + BuildNumber) }
+func Version() { fmt.Println("Troglodyte Engine v " + BuildNumber) }
 
 // GetTerminalSize returns the current width and height of the terminal window.
 // This matches the boundaries of the drawing buffer.
